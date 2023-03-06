@@ -37,7 +37,10 @@ type ChangePayload struct {
 // AppendEvent adds an Op to the client instance, this could be
 // an insert, remain, or any other operation
 func (c *Client) AppendEvent(ops delta.Delta) {
-	c.PendingChanges = *c.PendingChanges.Concat(ops)
+	c.PendingChanges = *c.PendingChanges.Compose(ops)
+	//c.Document = *c.Document.Transform(ops, true)
+	c.Document = *ops.Compose(c.Document)
+
 }
 
 // SendPendingEvents sends the pending Op to the server and
@@ -67,7 +70,23 @@ func (c *Client) SendPendingEvents(s *Server) {
 // We update our internal rev number to match the server
 func (c *Client) AckEvents(rev int64) {
 	c.LastSyncedRev = rev
+	log.Println("client ", c.ID)
+	log.Printf("1 client len %d:", len(c.SentChanges.Ops))
 	c.SentChanges = *delta.New(nil)
+	log.Printf("2 client len %d:", len(c.SentChanges.Ops))
+}
+
+// ReceiveServerEvent is called when the server sends updates to all clients (excluding the original sender of such Op)
+func (c *Client) ReceiveServerEvent(event delta.Delta, rev int64) {
+	c.LastSyncedRev = rev
+	log.Println("delta.Ops[0].Insert:", string(event.Ops[0].Insert))
+	log.Println("client ", c.ID)
+	log.Println("len(c.PendingChanges.Ops) ", len(c.PendingChanges.Ops))
+	c.PendingChanges = *event.Transform(c.PendingChanges, true)
+	log.Println("len(c.PendingChanges.Ops) ", len(c.PendingChanges.Ops))
+	log.Printf("c.PendingChanges.Ops[0]: %+v ", *c.PendingChanges.Ops[0].Retain)
+	log.Printf("c.PendingChanges.Ops[1]: %+v ", string(c.PendingChanges.Ops[1].Insert))
+	c.Document = *c.Document.Compose(event)
 }
 
 // PendingLen return the number of ops in the queue that have not been sent
@@ -94,17 +113,25 @@ func (s *Server) ProcessEvents() {
 	for _, p := range s.PendingChanges {
 		s.Document = *s.Document.Compose(p.Delta)
 		s.ProcessedRev++
-		s.BroadcastChangeApplied(p.ClientID, s.ProcessedRev)
+		p.LastSyncedRev = s.ProcessedRev
+		s.BroadcastChangeApplied(p)
 	}
 	s.PendingChanges = nil
 }
 
 // BroadcastChangeApplied sends an ack to the client that sent the last Op
 // and sends the op to all other clients
-func (s *Server) BroadcastChangeApplied(cid string, rev int64) {
-	log.Printf("ack for\ncid:\t%s\nrev:\t%d", cid, rev)
-	x := s.clients[cid]
-	x.AckEvents(rev)
+func (s *Server) BroadcastChangeApplied(p ChangePayload) {
+	//	log.Printf("ack for\ncid:\t%+v\n", p)
+	for k, v := range s.clients {
+		// send ack to original client
+		if k == p.ClientID {
+			v.AckEvents(p.LastSyncedRev)
+			continue
+		}
+		// send payload to all other clients
+		v.ReceiveServerEvent(p.Delta, p.LastSyncedRev)
+	}
 }
 
 // RegisterClient adds the client to the server Clients' list
